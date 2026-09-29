@@ -249,6 +249,7 @@ class Config:
     allowed_user_ids: frozenset[int]
     allowed_chat_ids: frozenset[int]
     team_chat_ids: frozenset[int]
+    auto_team_chats: bool
     allow_private_chats: bool
     workspace_per_chat: bool
     group_require_mention: bool
@@ -353,6 +354,7 @@ class Config:
             allowed_user_ids=allowed,
             allowed_chat_ids=_ids("ALLOWED_CHAT_IDS"),
             team_chat_ids=_ids("TEAM_CHAT_IDS"),
+            auto_team_chats=_bool("AUTO_TEAM_CHATS", True),
             allow_private_chats=_bool("ALLOW_PRIVATE_CHATS", True),
             workspace_per_chat=_bool("WORKSPACE_PER_CHAT", False),
             group_require_mention=_bool("GROUP_REQUIRE_MENTION", False),

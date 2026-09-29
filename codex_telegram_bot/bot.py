@@ -20,11 +20,19 @@ from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.enums import ChatAction
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramMigrateToChat,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    ChatMemberUpdated,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -97,7 +105,7 @@ HELP_TEXT = """🤖 <b>Codex в Telegram</b>
 /task описание — Codex создаст ветку от основной, внесёт изменения, прогонит тесты, сделает коммит, push и pull request. Следующие обычные сообщения продолжают работу в той же ветке и сессии.
 
 <b>В группе</b>
-Добавьте бота в группу и сделайте его администратором: без этого Telegram не передаёт ботам обычные сообщения. Дальше пишите как обычно: всё уходит в Codex. Хотите сказать что-то людям, а не боту — начните сообщение с /t. Реакция 👀 значит, что бот принял сообщение в работу, 👍 — ответил. В группах с темами у каждой темы свой проект и своя сессия.
+Добавьте бота в группу и сделайте его администратором: без этого Telegram не передаёт ботам обычные сообщения. Если бота добавил владелец, бот обычно сразу отвечает всем участникам группы; открыть группу вручную — /team, закрыть — /team off (команды владельца). Дальше пишите как обычно: всё уходит в Codex. Хотите сказать что-то людям, а не боту — начните сообщение с /t. Реакция 👀 значит, что бот принял сообщение в работу, 👍 — ответил. В группах с темами у каждой темы свой проект и своя сессия.
 
 <b>Прочее</b>
 /status — что выбрано и что выполняется
@@ -172,6 +180,14 @@ def addressed_to_bot(message: Message, bot_username: Optional[str], bot_id: Opti
     return False
 
 
+def bot_in_chat(member: Any) -> bool:
+    """Бот состоит в чате (ChatMember* из my_chat_member или getChatMember)."""
+    status = getattr(member, "status", None)
+    if status in {"creator", "administrator", "member"}:
+        return True
+    return status == "restricted" and bool(getattr(member, "is_member", False))
+
+
 def strip_mention(text: str, bot_username: Optional[str]) -> str:
     if not bot_username:
         return text.strip()
@@ -203,11 +219,15 @@ class AccessMiddleware(BaseMiddleware):
         allowed_chat_ids: frozenset[int] = frozenset(),
         allow_private_chats: bool = True,
         team_chat_ids: frozenset[int] = frozenset(),
+        is_open_group: Optional[Callable[[int], bool]] = None,
     ):
         self.allowed_user_ids = allowed_user_ids
         self.allowed_chat_ids = allowed_chat_ids
         self.allow_private_chats = allow_private_chats
         self.team_chat_ids = team_chat_ids
+        # Группы, которые владелец открыл для всех участников (добавил бота сам или /team);
+        # решение живёт в state.json, поэтому проверяется функцией движка при каждом сообщении.
+        self.is_open_group = is_open_group
 
     async def __call__(
         self,
@@ -223,6 +243,11 @@ class AccessMiddleware(BaseMiddleware):
                 return None
             return await handler(event, data)
         if not isinstance(event, Message):
+            return await handler(event, data)
+        if event.migrate_to_chat_id or event.migrate_from_chat_id:
+            # Служебное сообщение Telegram «группа стала супергруппой»: текста пользователя
+            # в нём нет, а автором может быть кто угодно (или никто). Обработчик только
+            # переносит решение о группе (открыта/закрыта) на новый ID.
             return await handler(event, data)
         user = event.from_user
         chat = event.chat
@@ -253,10 +278,13 @@ class AccessMiddleware(BaseMiddleware):
                 getattr(user, "id", None), getattr(user, "username", None), chat.id,
             )
             if user is not None and (command == "/id" or (command == "/start" and chat.type == "private")):
-                await event.answer(
+                text = (
                     f"⛔ Доступ запрещён. Ваш Telegram ID: <code>{user.id}</code>\n"
                     "Добавьте его в ALLOWED_USER_IDS в файле .env бота и перезапустите сервис."
                 )
+                if chat.type in GROUP_TYPES:
+                    text += "\nИли владелец бота может открыть эту группу для всех участников командой /team."
+                await event.answer(text)
             return None
 
         return await handler(event, data)
@@ -269,10 +297,14 @@ class AccessMiddleware(BaseMiddleware):
         return not self.allowed_chat_ids or chat.id in self.allowed_chat_ids
 
     def user_allowed(self, user_id: int, chat: Any) -> bool:
-        """Белый список пользователей, а в командных чатах — любой участник."""
+        """Белый список пользователей, а в командных и открытых владельцем группах — любой участник."""
         if user_id in self.allowed_user_ids:
             return True
-        return chat.type in GROUP_TYPES and chat.id in self.team_chat_ids
+        if chat.type not in GROUP_TYPES:
+            return False
+        if chat.id in self.team_chat_ids:
+            return True
+        return self.is_open_group is not None and self.is_open_group(chat.id)
 
 
 # --------------------------------------------------------------------------- задания
@@ -695,6 +727,7 @@ class Engine:
         self.codex_version_str = "неизвестно"
         self.bot_username: Optional[str] = None
         self.bot_id: Optional[int] = None
+        self.bot_reads_all = False  # режим приватности выключен у @BotFather: бот видит все сообщения групп
         self.tz = ZoneInfo(config.timezone)
 
     async def startup(self) -> None:
@@ -705,6 +738,7 @@ class Engine:
             me = await self.bot.get_me()
             self.bot_username = me.username
             self.bot_id = me.id
+            self.bot_reads_all = bool(me.can_read_all_group_messages)
         except Exception:  # noqa: BLE001
             log.exception("Не удалось получить данные бота (get_me)")
         log.info("Codex: %s (%s)", self.codex_version_str, self.config.codex_bin)
@@ -725,6 +759,13 @@ class Engine:
             log.warning("%s", self.concurrency_note)
         if self.config.allowed_chat_ids:
             log.info("Разрешённые чаты: %s", sorted(self.config.allowed_chat_ids))
+        try:
+            await self.prune_groups()
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось проверить при запуске, в каких группах состоит бот")
+        opened = self.open_groups()
+        if opened:
+            log.info("Группы, открытые владельцем для всех участников: %s", sorted(opened))
         if not self.config.allow_private_chats:
             log.info("Личные сообщения отключены (ALLOW_PRIVATE_CHATS=false)")
 
@@ -743,6 +784,75 @@ class Engine:
     def rate_limit_snapshots(self) -> dict:
         snapshots = self.state.meta.get("rate_limits")
         return snapshots if isinstance(snapshots, dict) else {}
+
+    def _group_access(self) -> dict[str, str]:
+        raw = self.state.meta.get("group_access")
+        return {k: v for k, v in raw.items() if v in {"open", "closed"}} if isinstance(raw, dict) else {}
+
+    def group_mode(self, chat_id: int) -> Optional[str]:
+        """«open» — группа открыта для всех участников, «closed» — владелец её закрыл (/team off,
+        публичная группа), None — решения нет: отвечаем только ALLOWED_USER_IDS, но добавление
+        бота владельцем откроет группу (AUTO_TEAM_CHATS)."""
+        return self._group_access().get(str(chat_id))
+
+    def is_open_group(self, chat_id: int) -> bool:
+        return self.group_mode(chat_id) == "open"
+
+    def open_groups(self) -> set[int]:
+        return {int(k) for k, v in self._group_access().items() if v == "open"}
+
+    def set_group_mode(self, chat_id: int, mode: Optional[str]) -> bool:
+        """Запоминает решение о группе (None — забыть группу); True, если что-то изменилось."""
+        access = self._group_access()
+        key = str(chat_id)
+        if access.get(key) == mode:
+            return False
+        if mode is None:
+            del access[key]
+        else:
+            access[key] = mode
+        self.state.meta["group_access"] = access
+        self.state.save()
+        return True
+
+    def move_group(self, old_id: int, new_id: int) -> bool:
+        """Группа стала супергруппой и сменила ID: решение о ней переходит на новый ID."""
+        access = self._group_access()
+        mode = access.pop(str(old_id), None)
+        if mode is None:
+            return False
+        access[str(new_id)] = mode
+        self.state.meta["group_access"] = access
+        self.state.save()
+        return True
+
+    async def prune_groups(self) -> None:
+        """Бота могли убрать из группы, пока сервис был выключен (Telegram хранит обновления
+        только сутки): при запуске забываем группы, где бота больше нет."""
+        if self.bot_id is None:
+            return
+        for key in list(self._group_access()):
+            chat_id = int(key)
+            try:
+                member = await self.bot.get_chat_member(chat_id, self.bot_id)
+            except TelegramMigrateToChat as exc:
+                self.move_group(chat_id, exc.migrate_to_chat_id)
+                continue
+            except (TelegramBadRequest, TelegramForbiddenError):
+                gone = True  # чата нет или бота из него убрали
+            except TelegramAPIError as exc:
+                log.warning("Не удалось проверить, состоит ли бот в группе %s: %s", chat_id, exc)
+                continue
+            else:
+                gone = not bot_in_chat(member)
+            if gone and self.set_group_mode(chat_id, None):
+                log.info("Бота больше нет в группе %s: забываю её", chat_id)
+
+    def cancel_chat(self, chat_id: int) -> None:
+        """Останавливает задания во всех разговорах чата (в группе с темами — во всех темах)."""
+        for key in list(self._runtimes):
+            if key.split(":")[0] == str(chat_id):
+                self.cancel(key)
 
     def conversation_dir(self, key: Union[int, str]) -> Path:
         return self.config.workspace_dir / ("chat_" + str(key).replace(":", "_").replace("-", "m"))
@@ -1339,6 +1449,106 @@ def build_router(engine: Engine) -> Router:
     def is_owner(user_id: Optional[int]) -> bool:
         return user_id is not None and user_id in cfg.allowed_user_ids
 
+    def group_access_line(chat_id: int) -> str:
+        if chat_id in cfg.team_chat_ids:
+            return "👥 Доступ: все участники группы (TEAM_CHAT_IDS)"
+        if engine.is_open_group(chat_id):
+            return "👥 Доступ: все участники группы (открыл владелец; закрыть — /team off)"
+        return "👥 Доступ: только ALLOWED_USER_IDS (открыть для всех участников — /team)"
+
+    @router.my_chat_member()
+    async def on_bot_membership(event: ChatMemberUpdated) -> None:
+        """Бота добавили в группу, изменили его права или убрали из неё.
+
+        Если бота добавил (или назначил администратором) владелец из ALLOWED_USER_IDS, а решения
+        о группе ещё нет, группа открывается для всех участников (AUTO_TEAM_CHATS): ID друзей знать
+        не нужно. Решение владельца (/team, /team off) такие события не меняют. Бота убрали — бот
+        забывает группу и останавливает её задания (ответ всё равно некуда отправить).
+        """
+        chat = event.chat
+        if chat.type not in GROUP_TYPES:
+            return
+        if not bot_in_chat(event.new_chat_member):
+            if engine.set_group_mode(chat.id, None):
+                log.info("Бота убрали из группы %s: она больше не открыта для всех участников", chat.id)
+            engine.cancel_chat(chat.id)
+            return
+        status = event.new_chat_member.status
+        if status not in {"member", "administrator"} or chat.id in cfg.team_chat_ids:
+            return
+        if not is_owner(event.from_user.id):
+            log.info(
+                "Бота добавил в группу %s (или изменил его права) пользователь %s не из ALLOWED_USER_IDS: "
+                "группа не открыта для всех участников", chat.id, event.from_user.id,
+            )
+            return
+        if not cfg.auto_team_chats or (cfg.allowed_chat_ids and chat.id not in cfg.allowed_chat_ids):
+            return
+        if engine.group_mode(chat.id) is not None:
+            return  # группа уже открыта или владелец её закрыл
+        if chat.username:
+            engine.set_group_mode(chat.id, "closed")
+            log.info("Группа %s публичная: для всех участников не открываю", chat.id)
+            text = (
+                "🔒 Группа публичная: вступить в неё может кто угодно, поэтому здесь я отвечаю только владельцу. "
+                "Открыть для всех участников всё равно — /team"
+            )
+        else:
+            engine.set_group_mode(chat.id, "open")
+            log.info("Владелец %s добавил бота в группу %s (%s): отвечаю всем её участникам", event.from_user.id, chat.id, chat.title)
+            text = "👥 Эту группу открыл владелец бота: здесь я отвечаю всем участникам. Отвечать только владельцу: /team off"
+            if status == "member" and not engine.bot_reads_all:
+                text += (
+                    "\n\nЧтобы я видел обычные сообщения, а не только команды, "
+                    "сделайте меня администратором группы (права можно минимальные)."
+                )
+        try:
+            await engine.bot.send_message(chat.id, text)
+        except TelegramAPIError as exc:  # нет права писать, сеть и т. п.: решение о группе уже сохранено
+            log.warning("Не удалось написать в группу %s: %s", chat.id, exc)
+
+    @router.message(F.migrate_to_chat_id | F.migrate_from_chat_id)
+    async def on_group_migrated(message: Message) -> None:
+        """Группа стала супергруппой и сменила ID (Telegram присылает сообщение и в старый, и в новый чат)."""
+        if message.migrate_to_chat_id:
+            old_id, new_id = message.chat.id, message.migrate_to_chat_id
+        else:
+            old_id, new_id = message.migrate_from_chat_id, message.chat.id
+        if engine.move_group(old_id, new_id):
+            log.info("Группа %s стала супергруппой %s: доступ к боту перенесён", old_id, new_id)
+
+    @router.message(Command("team"))
+    async def cmd_team(message: Message, command: CommandObject) -> None:
+        """Скрытая команда владельца: /team открывает группу для всех участников, /team off закрывает."""
+        if not is_owner(message.from_user.id if message.from_user else None):
+            return
+        if not is_group(message):
+            await message.answer("/team работает в группе: открывает её для всех участников (/team off — закрывает).")
+            return
+        arg = (command.args or "").strip().lower()
+        if arg not in {"", "on", "off"}:
+            await message.answer("Использование: /team — отвечать всем участникам группы, /team off — только ALLOWED_USER_IDS.")
+            return
+        chat_id = message.chat.id
+        if chat_id in cfg.team_chat_ids:
+            await message.answer(
+                "Эта группа указана в TEAM_CHAT_IDS (.env), поэтому открыта для всех участников всегда. "
+                "Изменить это можно только там, с перезапуском сервиса."
+            )
+            return
+        if arg == "off":
+            engine.set_group_mode(chat_id, "closed")
+            await message.answer(
+                "🔒 Теперь в этой группе я отвечаю только пользователям из ALLOWED_USER_IDS. "
+                "Уже принятые задания доработают (остановить — /stop). Открыть снова: /team"
+            )
+            return
+        engine.set_group_mode(chat_id, "open")
+        text = "👥 Теперь в этой группе я отвечаю всем участникам. Вернуть как было: /team off"
+        if message.chat.username:
+            text += "\n⚠️ Группа публичная: вступить в неё и писать мне может кто угодно."
+        await message.answer(text)
+
     @router.message(Command("quota", "limits"))
     async def cmd_quota(message: Message) -> None:
         """Скрытая команда: расход и обновление лимитов. Только для ALLOWED_USER_IDS, в меню не показывается."""
@@ -1465,7 +1675,10 @@ def build_router(engine: Engine) -> Router:
         key = conv_key(message)
         state = engine.state.get(key)
         project = engine.project_dir(state, key)
-        lines = [chat_line(message), f"📁 Проект: <code>{escape(str(project))}</code>"]
+        lines = [chat_line(message)]
+        if is_group(message):
+            lines.append(group_access_line(message.chat.id))
+        lines.append(f"📁 Проект: <code>{escape(str(project))}</code>")
         if await git_tasks.is_git_repo(project):
             branch = await git_tasks.current_branch(project)
             lines.append(f"🌿 Ветка: <code>{escape(branch or '?')}</code>")

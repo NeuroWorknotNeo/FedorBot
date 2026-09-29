@@ -1,6 +1,7 @@
 """Прогон настоящих aiogram-обновлений через Dispatcher с подменённой сессией Telegram."""
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Optional
 
@@ -8,12 +9,28 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
 from aiogram.enums import ParseMode
-from aiogram.methods import TelegramMethod
-from aiogram.types import CallbackQuery, Chat, Message, Update, User
+from aiogram.exceptions import TelegramForbiddenError, TelegramMigrateToChat
+from aiogram.methods import GetChatMember, TelegramMethod
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    ChatMemberAdministrator,
+    ChatMemberBanned,
+    ChatMemberLeft,
+    ChatMemberMember,
+    ChatMemberRestricted,
+    ChatMemberUpdated,
+    Message,
+    Update,
+    User,
+)
 from helpers import codex_prompts, make_config, make_repo
 
 from codex_telegram_bot.bot import AccessMiddleware, Engine, bot_commands, build_router
 from codex_telegram_bot.state import StateStore
+
+
+BOT_USER = User(id=42, is_bot=True, first_name="bot", username="testbot")
 
 
 class MockedSession(BaseSession):
@@ -23,6 +40,8 @@ class MockedSession(BaseSession):
         super().__init__()
         self.calls: list[TelegramMethod[Any]] = []
         self._next_id = 1000
+        # ответы getChatMember по чатам: ChatMember* или исключение; по умолчанию бот — участник
+        self.chat_members: dict[int, Any] = {}
 
     async def close(self) -> None:
         pass
@@ -42,6 +61,11 @@ class MockedSession(BaseSession):
             ).as_(bot)
         if name == "GetMe":
             return User(id=42, is_bot=True, first_name="bot", username="testbot")
+        if name == "GetChatMember":
+            answer = self.chat_members.get(method.chat_id, ChatMemberMember(user=BOT_USER))
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
         return True
 
     async def stream_content(self, url, headers=None, timeout=30, chunk_size=65536, raise_for_status=True) -> AsyncGenerator[bytes, None]:  # noqa: D401
@@ -61,8 +85,9 @@ def make_update(
     title: Optional[str] = None,
     thread_id: Optional[int] = None,
     reply_to_bot: bool = False,
+    username: Optional[str] = None,
 ) -> Update:
-    chat = Chat(id=chat_id, type=chat_type, title=title)
+    chat = Chat(id=chat_id, type=chat_type, title=title, username=username)
     reply = None
     if reply_to_bot:
         reply = Message(
@@ -93,7 +118,10 @@ def build(tmp_path, monkeypatch, **overrides):
     bot = Bot(cfg.telegram_token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     engine = Engine(bot, cfg, StateStore(tmp_path / "state.json"))
     dp = Dispatcher()
-    access = AccessMiddleware(cfg.allowed_user_ids, cfg.allowed_chat_ids, cfg.allow_private_chats, cfg.team_chat_ids)
+    access = AccessMiddleware(
+        cfg.allowed_user_ids, cfg.allowed_chat_ids, cfg.allow_private_chats, cfg.team_chat_ids,
+        is_open_group=engine.is_open_group,
+    )
     dp.message.outer_middleware(access)
     dp.callback_query.outer_middleware(access)
     dp.include_router(build_router(engine))
@@ -337,7 +365,7 @@ def test_model_and_effort_buttons(tmp_path, monkeypatch):
 
 
 def test_two_owners_share_group_and_have_own_private_chats(tmp_path, monkeypatch):
-    """Два ID в ALLOWED_USER_IDS (Фёдор и друг): оба владельцы, общая группа — один разговор."""
+    """Два ID в ALLOWED_USER_IDS: оба владельцы, общая группа — один разговор, в личке — у каждого свой."""
     group = -1004444444444
     cfg, session, bot, engine, dp = build(tmp_path, monkeypatch, ALLOWED_USER_IDS="1, 2", ALLOWED_CHAT_IDS=str(group))
 
@@ -359,6 +387,272 @@ def test_two_owners_share_group_and_have_own_private_chats(tmp_path, monkeypatch
     assert any(t == "Готово: личка второго | resume=none" for t in texts)          # в личке — свой разговор
     assert any("second-owner-shell" in t for t in texts)
     assert not any("чужой текст" in t for t in texts)
+
+
+def bot_member(status: str):
+    """ChatMember бота: member, administrator, left, kicked, restricted или restricted_left (ограничен и вышел)."""
+    if status == "member":
+        return ChatMemberMember(user=BOT_USER)
+    if status == "left":
+        return ChatMemberLeft(user=BOT_USER)
+    if status == "kicked":
+        return ChatMemberBanned(user=BOT_USER, until_date=0)
+    # набор обязательных прав администратора и ограниченного участника зависит от версии aiogram
+    cls = ChatMemberAdministrator if status == "administrator" else ChatMemberRestricted
+    fields: dict[str, Any] = {
+        n: False for n, f in cls.model_fields.items() if f.is_required() and n not in {"user", "until_date"}
+    }
+    if cls is ChatMemberRestricted:
+        fields.update(until_date=0, is_member=status == "restricted")
+    return cls(user=BOT_USER, **fields)
+
+
+def make_membership(
+    update_id: int, chat_id: int, by_user: int, new: str, old: str = "left",
+    chat_type: str = "supergroup", username: Optional[str] = None,
+) -> Update:
+    """Обновление my_chat_member: пользователь by_user изменил статус бота в группе."""
+    return Update(
+        update_id=update_id,
+        my_chat_member=ChatMemberUpdated(
+            chat=Chat(id=chat_id, type=chat_type, title="Мы вдвоём", username=username),
+            from_user=User(id=by_user, is_bot=False, first_name="Пользователь"),
+            date=datetime.now(timezone.utc),
+            old_chat_member=bot_member(old),
+            new_chat_member=bot_member(new),
+        ),
+    )
+
+
+def make_migration(
+    update_id: int, chat_id: int, *, to_id: Optional[int] = None, from_id: Optional[int] = None,
+    user_id: Optional[int] = 555, chat_type: str = "group",
+) -> Update:
+    """Служебное сообщение о переходе группы в супергруппу (в старом чате — to_id, в новом — from_id)."""
+    return Update(
+        update_id=update_id,
+        message=Message(
+            message_id=900 + update_id,
+            date=datetime.now(timezone.utc),
+            chat=Chat(id=chat_id, type=chat_type, title="Мы вдвоём"),
+            from_user=User(id=user_id, is_bot=False, first_name="Пользователь") if user_id else None,
+            migrate_to_chat_id=to_id,
+            migrate_from_chat_id=from_id,
+        ),
+    )
+
+
+def greetings(session: MockedSession) -> list[str]:
+    return [t for t in session.sent_texts() if "Эту группу открыл владелец" in t]
+
+
+def test_owner_adding_bot_opens_group_for_everyone(tmp_path, monkeypatch):
+    """Бота добавил владелец: в группе отвечаем всем участникам, ID друга знать не нужно."""
+    group, friend = -1005555555555, 555
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch)
+
+    async def go():
+        await engine.startup()
+        await dp.feed_update(bot, make_membership(1, group, by_user=1, new="member"))
+        await dp.feed_update(bot, make_update(2, "привет от друга", user_id=friend, chat_id=group, chat_type="supergroup", message_id=2))
+        await wait_done(engine, group)
+        await dp.feed_update(bot, make_update(3, "/status", user_id=friend, chat_id=group, chat_type="supergroup"))
+        # владелец назначил бота администратором в уже открытой группе — без повторного приветствия
+        await dp.feed_update(bot, make_membership(4, group, by_user=1, new="administrator", old="member"))
+        # команды владельца другу по-прежнему недоступны, закрыть группу он не может
+        await dp.feed_update(bot, make_update(5, "/sh echo friend-shell", user_id=friend, chat_id=group, chat_type="supergroup"))
+        await dp.feed_update(bot, make_update(6, "/team off", user_id=friend, chat_id=group, chat_type="supergroup"))
+        # в личке друг по-прежнему чужой
+        await dp.feed_update(bot, make_update(7, "привет в личку", user_id=friend, chat_id=friend, message_id=7))
+
+    asyncio.run(go())
+    texts = session.sent_texts()
+    assert len(greetings(session)) == 1 and "сделайте меня администратором" in greetings(session)[0]
+    assert any(t == "Готово: привет от друга | resume=none" for t in texts)
+    assert any("👥 Доступ: все участники группы (открыл владелец" in t for t in texts)
+    assert not any("friend-shell" in t for t in texts)
+    assert engine.is_open_group(group)
+    assert engine.runtime_info(friend) is None
+    assert codex_prompts(tmp_path) == ["привет от друга"]
+    assert StateStore(tmp_path / "state.json").meta["group_access"] == {str(group): "open"}  # переживает перезапуск
+
+
+def test_team_command_opens_and_closes_group(tmp_path, monkeypatch):
+    """Бота добавил не владелец: группа закрыта до /team; после /team off права бота её не открывают."""
+    group = -1006666666666
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch)
+
+    async def go():
+        await engine.startup()
+        await dp.feed_update(bot, make_membership(1, group, by_user=555, new="administrator"))
+        await dp.feed_update(bot, make_update(2, "до открытия", user_id=555, chat_id=group, chat_type="supergroup", message_id=2))
+        await dp.feed_update(bot, make_update(3, "/id", user_id=555, chat_id=group, chat_type="supergroup"))
+        await dp.feed_update(bot, make_update(4, "/status", chat_id=group, chat_type="supergroup"))
+        await dp.feed_update(bot, make_update(5, "/team", chat_id=group, chat_type="supergroup"))
+        await dp.feed_update(bot, make_update(6, "после открытия", user_id=555, chat_id=group, chat_type="supergroup", message_id=6))
+        await wait_done(engine, group)
+        await dp.feed_update(bot, make_update(7, "/team off", chat_id=group, chat_type="supergroup"))
+        # владелец потом меняет права бота — закрытая группа остаётся закрытой
+        await dp.feed_update(bot, make_membership(8, group, by_user=1, new="member", old="administrator"))
+        await dp.feed_update(bot, make_membership(9, group, by_user=1, new="administrator", old="member"))
+        await dp.feed_update(bot, make_update(10, "после закрытия", user_id=555, chat_id=group, chat_type="supergroup", message_id=10))
+        await wait_done(engine, group)
+        await dp.feed_update(bot, make_update(11, "/team", chat_id=1))
+
+    asyncio.run(go())
+    texts = session.sent_texts()
+    assert greetings(session) == []
+    assert codex_prompts(tmp_path) == ["после открытия"]
+    assert any("Доступ запрещён" in t and "/team" in t for t in texts)
+    assert any("👥 Доступ: только ALLOWED_USER_IDS" in t for t in texts)
+    assert any(t.startswith("👥 Теперь в этой группе я отвечаю всем участникам") for t in texts)
+    assert any(t.startswith("🔒 Теперь в этой группе") for t in texts)
+    assert any(t.startswith("/team работает в группе") for t in texts)
+    assert engine.group_mode(group) == "closed"
+
+
+def test_supergroup_migration_moves_access(tmp_path, monkeypatch):
+    """Группа стала супергруппой: решение о ней переходит на новый ID по любому из двух служебных сообщений."""
+    old1, new1 = -701, -1007010000001
+    old2, new2 = -702, -1007020000002
+    old3, new3 = -703, -1007030000003
+    anonymous_admin = 1087968824  # GroupAnonymousBot: такой автор бывает у сообщения в новом чате
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch)
+
+    async def go():
+        await engine.startup()
+        for n, chat in enumerate((old1, old2, old3)):
+            await dp.feed_update(bot, make_membership(10 + n, chat, by_user=1, new="member", chat_type="group"))
+        # только сообщение в старом чате (автор — друг)
+        await dp.feed_update(bot, make_migration(20, old1, to_id=new1, user_id=555))
+        # только сообщение в новом чате от анонимного администратора (без пропуска в middleware оно бы потерялось)
+        await dp.feed_update(bot, make_migration(21, new2, from_id=old2, user_id=anonymous_admin, chat_type="supergroup"))
+        # закрытая группа остаётся закрытой, и событие «бот в новой супергруппе» от владельца её не открывает
+        await dp.feed_update(bot, make_update(22, "/team off", chat_id=old3, chat_type="group"))
+        await dp.feed_update(bot, make_migration(23, old3, to_id=new3, user_id=1))
+        await dp.feed_update(bot, make_migration(24, new3, from_id=old3, user_id=1, chat_type="supergroup"))
+        await dp.feed_update(bot, make_membership(25, new3, by_user=1, new="member"))
+        await dp.feed_update(bot, make_update(26, "в новой супергруппе", user_id=555, chat_id=new1, chat_type="supergroup", message_id=26))
+        await wait_done(engine, new1)
+        await dp.feed_update(bot, make_update(27, "в закрытой супергруппе", user_id=555, chat_id=new3, chat_type="supergroup", message_id=27))
+
+    asyncio.run(go())
+    assert engine.open_groups() == {new1, new2}
+    assert engine.group_mode(new3) == "closed"
+    assert engine.group_mode(old1) is None and engine.group_mode(old2) is None and engine.group_mode(old3) is None
+    assert len(greetings(session)) == 3  # только при добавлении в исходные группы
+    assert codex_prompts(tmp_path) == ["в новой супергруппе"]
+
+
+def test_bot_removal_forgets_group(tmp_path, monkeypatch):
+    """Бота убрали (в том числе ограниченного) — группа забыта; вернул не владелец — она закрыта."""
+    kicked, restricted = -1008080808080, -1009090909090
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch)
+
+    async def go():
+        await engine.startup()
+        await dp.feed_update(bot, make_membership(1, kicked, by_user=1, new="member"))
+        await dp.feed_update(bot, make_membership(2, restricted, by_user=1, new="member"))
+        await dp.feed_update(bot, make_update(3, "до удаления", user_id=555, chat_id=kicked, chat_type="supergroup", message_id=3))
+        await wait_done(engine, kicked)
+        await dp.feed_update(bot, make_membership(4, kicked, by_user=1, new="kicked", old="member"))
+        # ограничили (бот ещё в группе) — группа открыта; ограниченного убрали — забыта
+        await dp.feed_update(bot, make_membership(5, restricted, by_user=555, new="restricted", old="member"))
+        assert engine.is_open_group(restricted)
+        await dp.feed_update(bot, make_membership(6, restricted, by_user=1, new="restricted_left", old="restricted"))
+        # бота вернул в группу не владелец — группа закрыта
+        await dp.feed_update(bot, make_membership(7, kicked, by_user=555, new="member"))
+        await dp.feed_update(bot, make_update(8, "после возвращения", user_id=555, chat_id=kicked, chat_type="supergroup", message_id=8))
+        await wait_done(engine, kicked)
+
+    asyncio.run(go())
+    assert engine.group_mode(kicked) is None and engine.group_mode(restricted) is None
+    assert codex_prompts(tmp_path) == ["до удаления"]
+
+
+def test_startup_forgets_groups_without_bot(tmp_path, monkeypatch):
+    """Пока бот был выключен, его могли убрать из группы: при запуске такие группы забываются."""
+    gone, stays, forbidden, migrated, new_id = -1001, -1002, -1003, -1004, -1004000000004
+    (tmp_path / "state.json").write_text(json.dumps({"chats": {}, "meta": {"group_access": {
+        str(gone): "open", str(stays): "open", str(forbidden): "closed", str(migrated): "open",
+    }}}))
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch)
+    session.chat_members = {
+        gone: ChatMemberLeft(user=BOT_USER),
+        forbidden: TelegramForbiddenError(
+            method=GetChatMember(chat_id=forbidden, user_id=42), message="Forbidden: bot was kicked from the group chat"
+        ),
+        migrated: TelegramMigrateToChat(
+            method=GetChatMember(chat_id=migrated, user_id=42), message="group chat was upgraded", migrate_to_chat_id=new_id
+        ),
+    }
+    asyncio.run(engine.startup())
+    assert engine.state.meta["group_access"] == {str(stays): "open", str(new_id): "open"}
+
+
+def test_auto_open_respects_chat_whitelist(tmp_path, monkeypatch):
+    listed, unlisted = -1008888888888, -1009999999999
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch, ALLOWED_CHAT_IDS=str(listed))
+
+    async def go():
+        await engine.startup()
+        await dp.feed_update(bot, make_membership(1, unlisted, by_user=1, new="administrator"))
+        await dp.feed_update(bot, make_membership(2, listed, by_user=1, new="administrator"))
+
+    asyncio.run(go())
+    assert engine.open_groups() == {listed}
+    assert len(greetings(session)) == 1 and "администратором" not in greetings(session)[0]  # бот уже администратор
+
+
+def test_team_chat_ids_group_is_not_touched(tmp_path, monkeypatch):
+    team = -1001212121212
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch, TEAM_CHAT_IDS=str(team))
+
+    async def go():
+        await engine.startup()
+        await dp.feed_update(bot, make_membership(1, team, by_user=1, new="member"))
+        await dp.feed_update(bot, make_update(2, "/team off", chat_id=team, chat_type="supergroup"))
+
+    asyncio.run(go())
+    assert greetings(session) == [] and engine.group_mode(team) is None
+    assert any("указана в TEAM_CHAT_IDS" in t for t in session.sent_texts())
+
+
+def test_public_group_is_not_opened_automatically(tmp_path, monkeypatch):
+    """В публичную группу может вступить кто угодно: открыть её можно только явно, командой /team."""
+    group = -1001414141414
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch)
+
+    async def go():
+        await engine.startup()
+        await dp.feed_update(bot, make_membership(1, group, by_user=1, new="member", username="public_chat"))
+        await dp.feed_update(bot, make_membership(2, group, by_user=1, new="administrator", old="member", username="public_chat"))
+        await dp.feed_update(bot, make_update(3, "до /team", user_id=555, chat_id=group, chat_type="supergroup", message_id=3))
+        assert engine.group_mode(group) == "closed"
+        await dp.feed_update(bot, make_update(4, "/team", chat_id=group, chat_type="supergroup", username="public_chat"))
+
+    asyncio.run(go())
+    texts = session.sent_texts()
+    assert greetings(session) == []
+    assert sum(t.startswith("🔒 Группа публичная") for t in texts) == 1
+    assert any("⚠️ Группа публичная" in t for t in texts)
+    assert engine.is_open_group(group)
+    assert codex_prompts(tmp_path) == []
+
+
+def test_auto_team_chats_disabled(tmp_path, monkeypatch):
+    group = -1001313131313
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch, AUTO_TEAM_CHATS="false")
+
+    async def go():
+        await engine.startup()
+        await dp.feed_update(bot, make_membership(1, group, by_user=1, new="member"))
+        assert engine.group_mode(group) is None
+        await dp.feed_update(bot, make_update(2, "/team", chat_id=group, chat_type="supergroup"))  # вручную — можно
+
+    asyncio.run(go())
+    assert greetings(session) == []
+    assert engine.is_open_group(group)
 
 
 def test_team_chat_admits_any_member(tmp_path, monkeypatch):

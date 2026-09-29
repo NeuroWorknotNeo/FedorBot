@@ -23,7 +23,7 @@ def base_env(monkeypatch, tmp_path):
         "CODEX_EXTRA_ARGS", "CODEX_EXTRA_INSTRUCTIONS", "CODEX_SANDBOX", "CODEX_MODEL", "CODEX_EFFORT",
         "MODEL_BUTTONS", "CODEX_TIMEOUT_SECONDS", "CODEX_NETWORK_ACCESS", "CODEX_WEB_SEARCH",
         "ALLOWED_CHAT_IDS", "TEAM_CHAT_IDS", "ALLOW_PRIVATE_CHATS", "WORKSPACE_PER_CHAT", "GROUP_REQUIRE_MENTION",
-        "TIMEZONE", "REACTION_WORKING", "REACTION_DONE",
+        "TIMEZONE", "REACTION_WORKING", "REACTION_DONE", "AUTO_TEAM_CHATS",
     ):
         monkeypatch.delenv(name, raising=False)
     return tmp_path
@@ -43,6 +43,7 @@ def test_defaults(base_env):
     assert cfg.allowed_chat_ids == frozenset()
     assert cfg.allow_private_chats is True
     assert cfg.group_require_mention is False
+    assert cfg.auto_team_chats is True
     assert cfg.default_model is None and cfg.default_effort is None
 
 
@@ -84,9 +85,11 @@ def test_group_settings(base_env, monkeypatch):
 def test_team_and_workspace_settings(base_env, monkeypatch):
     monkeypatch.setenv("TEAM_CHAT_IDS", "-100222")
     monkeypatch.setenv("WORKSPACE_PER_CHAT", "true")
+    monkeypatch.setenv("AUTO_TEAM_CHATS", "false")
     cfg = Config.from_env()
     assert cfg.team_chat_ids == frozenset({-100222})
     assert cfg.workspace_per_chat is True
+    assert cfg.auto_team_chats is False
 
 
 def test_effort_setting(base_env, monkeypatch):

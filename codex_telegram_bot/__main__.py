@@ -54,7 +54,8 @@ async def run() -> None:
     engine = Engine(bot, config, StateStore(config.state_file))
     dispatcher = Dispatcher()
     access = AccessMiddleware(
-        config.allowed_user_ids, config.allowed_chat_ids, config.allow_private_chats, config.team_chat_ids
+        config.allowed_user_ids, config.allowed_chat_ids, config.allow_private_chats, config.team_chat_ids,
+        is_open_group=engine.is_open_group,
     )
     dispatcher.message.outer_middleware(access)
     dispatcher.callback_query.outer_middleware(access)
@@ -65,7 +66,8 @@ async def run() -> None:
     await bot.set_my_commands(bot_commands())
     log.info("Бот @%s запущен; разрешённые пользователи: %s", engine.bot_username, sorted(config.allowed_user_ids))
     try:
-        await dispatcher.start_polling(bot, allowed_updates=["message", "callback_query"])
+        # my_chat_member — бота добавили в группу или убрали: так бот узнаёт группы, открытые владельцем.
+        await dispatcher.start_polling(bot, allowed_updates=["message", "callback_query", "my_chat_member"])
     finally:
         await bot.session.close()
 
