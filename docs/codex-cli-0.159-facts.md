@@ -1407,6 +1407,8 @@ Consequences:
 | `gpt-5.5` | GPT-5.5 | Legacy coding model. | list | 12 | medium | low, medium, high, xhigh | 272000 / 272000 | direct (`exec_command`, `apply_patch`, … as normal tools) | no |
 | `codex-auto-review` | Codex Auto Review | Automatic approval review model for Codex. | hide | 43 | medium | low … max | 272000 / 872000 | code_mode_only | yes |
 
+**Update 2026-09-29 (after 0.159.0): GPT-6.1 Sol.** SOURCE: `codex-rs/models-manager/models.json` at openai/codex main, merge commit `b1e72963` of PR #49318 ("Add GPT-6.1 Sol as the default catalog model"), backported to `release/0.159` for 0.159.1 (#49323). New entry `gpt-6.1-sol`, display "GPT-6.1-Sol", "Latest workhorse model for coding and everyday work.", visibility `list`, **priority 1** (so it becomes the default model), default effort **low**, efforts low … ultra, context 272000 / 872000, `code_mode_only`, `minimal_client_version` **0.153.0** (0.159.0 can use it), service tier `priority` ("Fast", "2x speed, increased usage"), plans include plus/pro/business. The other priorities shift by one (gpt-6-astra 2, gpt-6-sol 3, gpt-6-luna 4, …). API docs: model ID `gpt-6.1-sol`.
+
 **Effort descriptions** (identical for all models):
 - `low`: "Fast responses with lighter reasoning"
 - `medium`: "Balances speed and reasoning depth for everyday tasks"

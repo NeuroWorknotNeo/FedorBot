@@ -343,7 +343,7 @@ def test_model_and_effort_buttons(tmp_path, monkeypatch):
         await dp.feed_update(bot, make_callback(2, "model:gpt-6-astra"))
         await dp.feed_update(bot, make_callback(3, "effort:high"))
         await dp.feed_update(bot, make_callback(4, "model:не модель"))
-        await dp.feed_update(bot, make_callback(5, "model:gpt-6-sol", user_id=999))  # чужой — отклоняется
+        await dp.feed_update(bot, make_callback(5, "model:gpt-6.1-sol", user_id=999))  # чужой — отклоняется
         await dp.feed_update(bot, make_callback(6, "effort:default"))
 
     asyncio.run(go())
@@ -352,8 +352,8 @@ def test_model_and_effort_buttons(tmp_path, monkeypatch):
     assert keyboard, "/model без аргумента должен прислать кнопки"
     labels = [b.text for row in keyboard[0].reply_markup.inline_keyboard for b in row]
     # на кнопках — точные имена моделей, по одной на семейство
-    assert labels == ["✅ По умолчанию", "GPT-6 Astra", "GPT-6 Sol", "GPT-6 Luna"]
-    assert [b.callback_data for row in keyboard[0].reply_markup.inline_keyboard for b in row if b.text == "GPT-6 Sol"] == ["model:gpt-6-sol"]
+    assert labels == ["✅ По умолчанию", "GPT-6 Astra", "GPT-6.1 Sol", "GPT-6 Luna"]
+    assert [b.callback_data for row in keyboard[0].reply_markup.inline_keyboard for b in row if b.text == "GPT-6.1 Sol"] == ["model:gpt-6.1-sol"]
     answers = [m for m in session.calls if type(m).__name__ == "AnswerCallbackQuery"]
     assert [a.text for a in answers] == ["Модель: gpt-6-astra", "Рассуждения: high", "Неизвестная модель", "⛔ Нет доступа", "Рассуждения: по умолчанию"]
     edits = [m for m in session.calls if type(m).__name__ == "EditMessageText"]

@@ -39,7 +39,7 @@ ULTRA_ALIASES = ("ultra", "ultracode")
 DEFAULT_MODEL_BUTTONS = (
     ("default", "По умолчанию"),
     ("gpt-6-astra", "GPT-6 Astra"),
-    ("gpt-6-sol", "GPT-6 Sol"),
+    ("gpt-6.1-sol", "GPT-6.1 Sol"),
     ("gpt-6-luna", "GPT-6 Luna"),
 )
 MODEL_FAMILIES = ("astra", "sol", "luna")
