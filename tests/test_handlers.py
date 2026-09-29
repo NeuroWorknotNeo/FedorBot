@@ -477,6 +477,40 @@ def test_owner_adding_bot_opens_group_for_everyone(tmp_path, monkeypatch):
     assert StateStore(tmp_path / "state.json").meta["group_access"] == {str(group): "open"}  # переживает перезапуск
 
 
+def test_group_stays_open_after_owner_leaves(tmp_path, monkeypatch):
+    """Владелец настроил группу для друга и вышел из неё — бот по-прежнему отвечает другу, в том числе после перезапуска."""
+    group, friend = -1001515151515, 555
+
+    def owner_left(update_id: int) -> Update:
+        owner = User(id=1, is_bot=False, first_name="Владелец")
+        return Update(update_id=update_id, message=Message(
+            message_id=update_id, date=datetime.now(timezone.utc), chat=Chat(id=group, type="supergroup"),
+            from_user=owner, left_chat_member=owner,
+        ))
+
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch)
+
+    async def go():
+        await engine.startup()
+        await dp.feed_update(bot, make_membership(1, group, by_user=1, new="administrator"))
+        await dp.feed_update(bot, owner_left(2))
+        await dp.feed_update(bot, make_update(3, "владелец ушёл", user_id=friend, chat_id=group, chat_type="supergroup", message_id=3))
+        await wait_done(engine, group)
+
+    asyncio.run(go())
+    # перезапуск сервиса: бот всё ещё в группе (getChatMember), группа остаётся открытой
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch)
+
+    async def after_restart():
+        await engine.startup()
+        await dp.feed_update(bot, make_update(4, "после перезапуска", user_id=friend, chat_id=group, chat_type="supergroup", message_id=4))
+        await wait_done(engine, group)
+
+    asyncio.run(after_restart())
+    assert engine.is_open_group(group)
+    assert codex_prompts(tmp_path) == ["владелец ушёл", "после перезапуска"]
+
+
 def test_team_command_opens_and_closes_group(tmp_path, monkeypatch):
     """Бота добавил не владелец: группа закрыта до /team; после /team off права бота её не открывают."""
     group = -1006666666666
