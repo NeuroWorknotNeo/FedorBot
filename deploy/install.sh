@@ -105,7 +105,8 @@ cat <<NEXT
      sudo -iu $BOT_USER git config --global user.email "you@example.com"
 
 3) Заполнить $INSTALL_DIR/.env: TELEGRAM_BOT_TOKEN (от @BotFather) и
-   ALLOWED_USER_IDS (ваш Telegram ID; его покажет бот на /id или @userinfobot).
+   ALLOWED_USER_IDS (Telegram ID через запятую: ваш и, если боту отвечать двоим,
+   второго человека; ID покажет бот на /id или @userinfobot).
 
 4) Запустить и посмотреть логи:
      sudo systemctl start $SERVICE_NAME

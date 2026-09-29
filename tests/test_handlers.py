@@ -336,6 +336,31 @@ def test_model_and_effort_buttons(tmp_path, monkeypatch):
     assert engine.state.get(1).effort is None
 
 
+def test_two_owners_share_group_and_have_own_private_chats(tmp_path, monkeypatch):
+    """Два ID в ALLOWED_USER_IDS (Фёдор и друг): оба владельцы, общая группа — один разговор."""
+    group = -1004444444444
+    cfg, session, bot, engine, dp = build(tmp_path, monkeypatch, ALLOWED_USER_IDS="1, 2", ALLOWED_CHAT_IDS=str(group))
+
+    async def go():
+        await engine.startup()
+        await dp.feed_update(bot, make_update(1, "вопрос от первого", user_id=1, chat_id=group, chat_type="supergroup", message_id=1))
+        await wait_done(engine, group)
+        await dp.feed_update(bot, make_update(2, "вопрос от второго", user_id=2, chat_id=group, chat_type="supergroup", message_id=2))
+        await wait_done(engine, group)
+        await dp.feed_update(bot, make_update(3, "личка второго", user_id=2, chat_id=2, message_id=3))
+        await wait_done(engine, 2)
+        await dp.feed_update(bot, make_update(4, "/sh echo second-owner-shell", user_id=2, chat_id=group, chat_type="supergroup"))
+        await dp.feed_update(bot, make_update(5, "чужой текст", user_id=777, chat_id=group, chat_type="supergroup"))
+
+    asyncio.run(go())
+    texts = session.sent_texts()
+    assert any(t == "Готово: вопрос от первого | resume=none" for t in texts)
+    assert any(t == "Готово: вопрос от второго | resume=sess-123" for t in texts)  # та же сессия группы
+    assert any(t == "Готово: личка второго | resume=none" for t in texts)          # в личке — свой разговор
+    assert any("second-owner-shell" in t for t in texts)
+    assert not any("чужой текст" in t for t in texts)
+
+
 def test_team_chat_admits_any_member(tmp_path, monkeypatch):
     personal, team = -100111, -100222
     cfg, session, bot, engine, dp = build(
