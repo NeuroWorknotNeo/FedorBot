@@ -1,0 +1,33 @@
+# systemd-юнит Telegram-бота для Codex.
+# install.sh подставляет пользователя и каталог; при ручной установке замените
+# codexbot и /opt/codex-telegram-bot на свои значения и положите файл в
+# /etc/systemd/system/codex-telegram-bot.service
+
+[Unit]
+Description=Codex Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codexbot
+Group=codexbot
+WorkingDirectory=/opt/codex-telegram-bot
+EnvironmentFile=/opt/codex-telegram-bot/.env
+Environment=PATH=/home/codexbot/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/codex-telegram-bot/.venv/bin/python -m codex_telegram_bot
+Restart=always
+RestartSec=5
+# При остановке сервиса SIGTERM получает бот, а через TimeoutStopSec
+# добиваются и дочерние процессы codex, чтобы ничего не осталось висеть.
+KillMode=mixed
+TimeoutStopSec=45
+# Если OOM-killer убил ДОЧЕРНИЙ процесс (например, тяжёлый расчёт, запущенный
+# Codex), systemd по умолчанию считает весь юнит упавшим и перезапускает бота —
+# а перезапуск обрывает все текущие запуски. С continue бот остаётся жив, а
+# Codex просто увидит, что его команда убита, и сообщит об этом.
+OOMPolicy=continue
+
+[Install]
+WantedBy=multi-user.target
